@@ -38,8 +38,8 @@
 		                            <td>{{ optional($attendance->clock_in)->format('H:i') ?? '-' }}</td>
 		                            <td>{{ optional($attendance->clock_out)->format('H:i') ?? '-' }}</td>
                                     <td>
-                                        @if ($attendance->clock_in)
-                                            01:00
+                                        @if ($attendance->break_duration)
+                                            {{ sprintf('%02d:%02d', intval($attendance->break_duration / 60), $attendance->break_duration % 60) }}
                                         @else
                                             -
                                         @endif

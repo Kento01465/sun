@@ -10,29 +10,68 @@ use Illuminate\Support\Facades\Auth;
 
 class AttendanceController extends Controller
 {
-    /**
-     * ダッシュボード画面
-     */
-    public function index()
+    public function __construct()
     {
-        $user = Auth::user();
+        // 認証チェック
+        if (!Auth::check()) {
+            return redirect()->route('login');
+        }
 
-        $start = Carbon::now()->startOfMonth();
-        $end = Carbon::now()->endOfMonth();
+        // 定数の初期化
+        $this->user = Auth::user();
+        $this->currentDate = Carbon::now();
+    }
 
-        $records = TimeRecord::where('user_id', $user->id)
-            ->whereBetween('clock_in', [$start, $end])
-            ->orderBy('clock_in', 'asc')
-            ->get();
+    /**
+     * 共通：勤務時間計算
+     */
+    protected function calculateWorkTime($clockIn, $clockOut, $breakMinutes = 0)
+    {
+        if (!$clockIn || !$clockOut) {
+            return null;
+        }
 
+        $totalSeconds = $clockIn->diffInSeconds($clockOut);
+        $breakSeconds = $breakMinutes * 60;
+        $workSeconds = max($totalSeconds - $breakSeconds, 0);
+
+        return [
+            'total_seconds' => $totalSeconds,
+            'work_seconds' => $workSeconds,
+            'formatted' => $this->formatTime($workSeconds)
+        ];
+    }
+
+    /**
+     * 共通：時間フォーマット
+     */
+    protected function formatTime($totalSeconds)
+    {
+        $hours = floor($totalSeconds / 3600);
+        $minutes = floor(($totalSeconds % 3600) / 60);
+        return str_pad($hours, 2, '0', STR_PAD_LEFT) . ':' . str_pad($minutes, 2, '0', STR_PAD_LEFT);
+    }
+
+    /**
+     * 共通：期間の日付範囲生成
+     */
+    protected function generateDateRange($start, $end)
+    {
         $dates = collect();
         for ($date = $start->copy(); $date->lte($end); $date->addDay()) {
             $dates->push($date->copy());
         }
+        return $dates;
+    }
 
-        $attendances = $dates->map(function($date) use ($records) {
+    /**
+     * 共通：勤怠データマッピング
+     */
+    protected function mapAttendanceData($dates, $records)
+    {
+        return $dates->map(function($date) use ($records) {
             $record = $records->first(function($r) use ($date) {
-                return $r->clock_in->toDateString() === $date->toDateString();
+                return $r->clock_in && $r->clock_in->toDateString() === $date->toDateString();
             });
 
             if ($record) {
@@ -41,25 +80,79 @@ class AttendanceController extends Controller
                 return (object)[
                     'clock_in' => null,
                     'clock_out' => null,
-                    'note' => null,
+                    'break_duration' => null,
+                    'notes' => null,
                     'id' => null,
                     'date' => $date,
                 ];
             }
         });
+    }
 
+    /**
+     * 共通：合計勤務時間計算
+     */
+    protected function calculateTotalWorkTime($attendances)
+    {
         $totalSeconds = 0;
+
         foreach ($attendances as $attendance) {
             if ($attendance->clock_in && $attendance->clock_out) {
-                $seconds = $attendance->clock_in->diffInSeconds($attendance->clock_out);
-                $workSeconds = max($seconds - 3600, 0); // 休憩1時間引く
-                $totalSeconds += $workSeconds;
+                $workTime = $this->calculateWorkTime(
+                    $attendance->clock_in,
+                    $attendance->clock_out,
+                    $attendance->break_duration ?? 0
+                );
+                if ($workTime) {
+                    $totalSeconds += $workTime['work_seconds'];
+                }
             }
         }
 
-        $totalHours = floor($totalSeconds / 3600);
-        $totalMinutes = floor(($totalSeconds % 3600) / 60);
-        $totalTime = str_pad($totalHours, 2, '0', STR_PAD_LEFT) . ':' . str_pad($totalMinutes, 2, '0', STR_PAD_LEFT);
+        return $this->formatTime($totalSeconds);
+    }
+
+    /**
+     * 共通：出勤中レコード取得
+     */
+    protected function getCurrentWorkingRecord()
+    {
+        return TimeRecord::where('user_id', $this->user->id)
+            ->whereNull('clock_out')
+            ->latest()
+            ->first();
+    }
+
+    /**
+     * 共通：月間レコード取得
+     */
+    protected function getMonthlyRecords($year = null, $month = null)
+    {
+        $year = $year ?? $this->currentDate->year;
+        $month = $month ?? $this->currentDate->month;
+
+        $start = Carbon::create($year, $month)->startOfMonth();
+        $end = Carbon::create($year, $month)->endOfMonth();
+
+        return [
+            'records' => TimeRecord::where('user_id', $this->user->id)
+                ->whereBetween('clock_in', [$start, $end])
+                ->orderBy('clock_in', 'asc')
+                ->get(),
+            'start' => $start,
+            'end' => $end
+        ];
+    }
+
+    /**
+     * ダッシュボード画面
+     */
+    public function index()
+    {
+        $monthlyData = $this->getMonthlyRecords();
+        $dates = $this->generateDateRange($monthlyData['start'], $monthlyData['end']);
+        $attendances = $this->mapAttendanceData($dates, $monthlyData['records']);
+        $totalTime = $this->calculateTotalWorkTime($attendances);
 
         return view('attendance.index', compact('attendances', 'totalTime'));
     }
@@ -69,21 +162,15 @@ class AttendanceController extends Controller
      */
     public function clockIn(Request $request)
     {
-        $user = Auth::user();
-
-        // すでに出勤中かどうかを確認（例: clock_outがnullのレコードがあれば出勤中）
-        $existingRecord = TimeRecord::where('user_id', $user->id)
-            ->whereNull('clock_out')
-            ->latest()
-            ->first();
+        $existingRecord = $this->getCurrentWorkingRecord();
 
         if ($existingRecord) {
             return redirect()->back()->with('error', 'すでに出勤中です。');
         }
 
         $timeRecord = new TimeRecord();
-        $timeRecord->user_id = $user->id;
-        $timeRecord->clock_in = now();
+        $timeRecord->user_id = $this->user->id;
+        $timeRecord->clock_in = $this->currentDate;
         $timeRecord->save();
 
         return redirect()->back()->with('success', '出勤打刻しました。');
@@ -94,19 +181,13 @@ class AttendanceController extends Controller
      */
     public function clockOut(Request $request)
     {
-        $user = Auth::user();
-
-        // 最後の出勤中レコードを取得
-        $record = TimeRecord::where('user_id', $user->id)
-            ->whereNull('clock_out')
-            ->latest()
-            ->first();
+        $record = $this->getCurrentWorkingRecord();
 
         if (!$record) {
             return redirect()->back()->with('error', '出勤記録が見つかりません。');
         }
 
-        $record->clock_out = now();
+        $record->clock_out = $this->currentDate;
         $record->save();
 
         return redirect()->back()->with('success', '退勤打刻しました。');
@@ -123,6 +204,7 @@ class AttendanceController extends Controller
         $attendance = TimeRecord::findOrFail($id);
         $attendance->clock_in = $request->input('clock_in');
         $attendance->clock_out = $request->input('clock_out');
+        $attendance->break_duration = $request->input('break_duration');
         $attendance->notes = $request->input('notes');
         $attendance->save();
 
@@ -142,30 +224,27 @@ class AttendanceController extends Controller
      */
     public function dashboard()
     {
-        $today = now()->startOfDay();
+        $today = $this->currentDate->startOfDay();
 
-        // ログインユーザーのチームメンバーを取得（例：同部署のユーザー）
-        $teamMembers = User::where('department', auth()->user()->department)->get();
+        // チームメンバーを取得
+        $teamMembers = User::where('department', $this->user->department)->get();
 
-        // 各メンバーの本日の勤怠を取得（存在しなければnull）
         $attendances = [];
-
         foreach ($teamMembers as $member) {
             $attendance = TimeRecord::where('user_id', $member->id)
                 ->whereDate('clock_in', $today)
                 ->first();
 
             if (!$attendance) {
-                // 空データを用意（必要に応じて）
                 $attendance = new TimeRecord();
                 $attendance->user_id = $member->id;
                 $attendance->user = $member;
                 $attendance->clock_in = null;
                 $attendance->clock_out = null;
+                $attendance->break_duration = null;
                 $attendance->notes = null;
                 $attendance->date = $today;
             } else {
-                // リレーションでユーザー情報がない場合はセット
                 $attendance->user = $member;
             }
 
@@ -175,85 +254,51 @@ class AttendanceController extends Controller
         return view('attendance.dashboard', compact('attendances'));
     }
 
-
     /**
      * 履歴表示
      */
     public function history(Request $request)
     {
-        $year = $request->input('year', now()->year);
-        $month = $request->input('month', now()->month);
+        $year = $request->input('year', $this->currentDate->year);
+        $month = $request->input('month', $this->currentDate->month);
 
-        $startOfMonth = Carbon::create($year, $month)->startOfMonth();
-        $endOfMonth = Carbon::create($year, $month)->endOfMonth();
-
-        $dates = collect();
-        for ($date = $startOfMonth->copy(); $date->lte($endOfMonth); $date->addDay()) {
-            $dates->push($date->copy());
-        }
-
-        $records = TimeRecord::where('user_id', Auth::id())
-            ->whereBetween('clock_in', [$startOfMonth, $endOfMonth])
-            ->get();
-
-        $attendances = $dates->map(function ($date) use ($records) {
-            $record = $records->first(function ($r) use ($date) {
-                return $r->clock_in && $r->clock_in->format('Y-m-d') === $date->format('Y-m-d');
-            });
-
-            if ($record) {
-                return $record;
-            } else {
-                $dummy = new \stdClass();
-                $dummy->date = $date;
-                $dummy->clock_in = null;
-                $dummy->clock_out = null;
-                $dummy->notes = null;
-                $dummy->id = null;
-                return $dummy;
-            }
-        });
-
-        $totalSeconds = 0;
-        foreach ($attendances as $attendance) {
-            if ($attendance->clock_in && $attendance->clock_out) {
-                $seconds = $attendance->clock_in->diffInSeconds($attendance->clock_out);
-                $workSeconds = max($seconds - 3600, 0); // 休憩1時間引く
-                $totalSeconds += $workSeconds;
-            }
-        }
-
-        $totalHours = floor($totalSeconds / 3600);
-        $totalMinutes = floor(($totalSeconds % 3600) / 60);
-        $totalTime = str_pad($totalHours, 2, '0', STR_PAD_LEFT) . ':' . str_pad($totalMinutes, 2, '0', STR_PAD_LEFT);
+        $monthlyData = $this->getMonthlyRecords($year, $month);
+        $dates = $this->generateDateRange($monthlyData['start'], $monthlyData['end']);
+        $attendances = $this->mapAttendanceData($dates, $monthlyData['records']);
+        $totalTime = $this->calculateTotalWorkTime($attendances);
 
         return view('attendance.history', compact('attendances', 'year', 'month', 'totalTime'));
     }
-
 
     /**
      * CSVエクスポート
      */
     public function export(Request $request)
     {
-        $year = $request->input('year', now()->year);
-        $month = $request->input('month', now()->month);
+        $year = $request->input('year', $this->currentDate->year);
+        $month = $request->input('month', $this->currentDate->month);
 
-        $start = Carbon::create($year, $month, 1)->startOfDay();
-        $end = Carbon::create($year, $month, 1)->endOfMonth()->endOfDay();
+        $monthlyData = $this->getMonthlyRecords($year, $month);
+        $records = $monthlyData['records']->groupBy(function ($item) {
+            return $item->clock_in->format('Y-m-d');
+        });
 
-        $user = Auth::user();
+        $csvData = $this->generateCSVData($records, $monthlyData['start']);
+        $csvContent = $this->generateCSVContent($csvData);
+        $filename = "attendance_{$year}_{$month}.csv";
 
-        $records = TimeRecord::where('user_id', $user->id)
-            ->whereBetween('clock_in', [$start, $end])
-            ->orderBy('clock_in', 'asc')
-            ->get()
-            ->groupBy(function ($item) {
-                return $item->clock_in->format('Y-m-d');
-            });
+        return response($csvContent)
+            ->header('Content-Type', 'text/csv')
+            ->header('Content-Disposition', "attachment; filename={$filename}");
+    }
 
+    /**
+     * CSV用データ生成
+     */
+    protected function generateCSVData($records, $start)
+    {
         $csvHeader = ["氏名", "部署", "日付", "出勤時間", "退勤時間", "勤務時間", "休憩時間", "備考"];
-        $csvData = [];
+        $csvData = [$csvHeader];
 
         $daysInMonth = $start->daysInMonth;
 
@@ -263,57 +308,50 @@ class AttendanceController extends Controller
 
             if (isset($records[$dateKey])) {
                 $record = $records[$dateKey]->first();
-                $clockIn = $record->clock_in ? $record->clock_in->format('H:i') : '-';
-                $clockOut = $record->clock_out ? $record->clock_out->format('H:i') : '-';
+                $workTime = $this->calculateWorkTime(
+                    $record->clock_in,
+                    $record->clock_out,
+                    $record->break_duration ?? 0
+                );
 
-                // 勤務時間計算
-                if ($record->clock_in && $record->clock_out) {
-                    $totalSeconds = $record->clock_in->diffInSeconds($record->clock_out);
-                    $breakSeconds = 3600; // 1時間固定
-                    $workSeconds = max($totalSeconds - $breakSeconds, 0);
-                    $hours = floor($workSeconds / 3600);
-                    $minutes = floor(($workSeconds % 3600) / 60);
-                    $workTime = sprintf('%02d:%02d', $hours, $minutes);
-                    $breakTime = "01:00";
-                } else {
-                    $workTime = "-";
-                    $breakTime = "-";
-                }
+                $breakHours = floor(($record->break_duration ?? 0) / 60);
+                $breakMinutes = ($record->break_duration ?? 0) % 60;
+                $breakFormatted = str_pad($breakHours, 2, '0', STR_PAD_LEFT) . ':' . str_pad($breakMinutes, 2, '0', STR_PAD_LEFT);
 
-                $note = $record->notes ?? "-";
+                $csvData[] = [
+                    $this->user->name,
+                    $this->user->department ?? "-",
+                    $dateKey,
+                    $record->clock_in ? $record->clock_in->format('H:i') : '-',
+                    $record->clock_out ? $record->clock_out->format('H:i') : '-',
+                    $workTime ? $workTime['formatted'] : '-',
+                    $breakFormatted ? $breakFormatted : '-',
+                    $record->notes ?? "-",
+                ];
             } else {
-                $clockIn = "-";
-                $clockOut = "-";
-                $workTime = "-";
-                $breakTime = "-";
-                $note = "-";
+                $csvData[] = [
+                    $this->user->name,
+                    $this->user->department ?? "-",
+                    $dateKey,
+                    "-", "-", "-", "-", "-",
+                ];
             }
-
-            $csvData[] = [
-                $user->name,
-                $user->department ?? "-",
-                $dateKey,
-                $clockIn,
-                $clockOut,
-                $workTime,
-                $breakTime,
-                $note,
-            ];
         }
 
-        $filename = "attendance_{$year}_{$month}.csv";
+        return $csvData;
+    }
 
+    /**
+     * CSV内容生成
+     */
+    protected function generateCSVContent($csvData)
+    {
         ob_start();
         $handle = fopen('php://output', 'w');
-        fputcsv($handle, $csvHeader);
         foreach ($csvData as $row) {
             fputcsv($handle, $row);
         }
         fclose($handle);
-        $csvContent = ob_get_clean();
-
-        return response($csvContent)
-            ->header('Content-Type', 'text/csv')
-            ->header('Content-Disposition', "attachment; filename={$filename}");
+        return ob_get_clean();
     }
 }

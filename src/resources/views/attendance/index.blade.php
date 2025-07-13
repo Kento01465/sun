@@ -82,8 +82,8 @@
                                     <td>{{ optional($attendance->clock_in)->format('H:i') ?? '-' }}</td>
                                     <td>{{ optional($attendance->clock_out)->format('H:i') ?? '-' }}</td>
                                     <td>
-                                        @if ($attendance->clock_in)
-                                            01:00
+                                        @if ($attendance->break_duration)
+                                            {{ sprintf('%02d:%02d', intval($attendance->break_duration / 60), $attendance->break_duration % 60) }}
                                         @else
                                             -
                                         @endif
@@ -92,8 +92,9 @@
                                         @if ($attendance->clock_in && $attendance->clock_out)
                                             @php
                                                 $totalSeconds = $attendance->clock_in->diffInSeconds($attendance->clock_out);
-                                                // 休憩時間（1時間 = 3600秒）
-                                                $workSeconds = max($totalSeconds - 3600, 0);
+                                                // 実際の休憩時間を秒に変換（break_durationが分単位の場合）
+                                                $breakSeconds = $attendance->break_duration ? $attendance->break_duration * 60 : 0;
+                                                $workSeconds = max($totalSeconds - $breakSeconds, 0);
 
                                                 $hours = floor($workSeconds / 3600);
                                                 $minutes = floor(($workSeconds % 3600) / 60);

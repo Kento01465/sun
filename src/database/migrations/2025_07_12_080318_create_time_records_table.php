@@ -16,7 +16,7 @@ return new class extends Migration
             $table->foreignId('user_id')->constrained()->onDelete('cascade');
             $table->timestamp('clock_in')->nullable();
             $table->timestamp('clock_out')->nullable();
-            $table->integer('break_duration')->default(0);
+            $table->integer('break_duration')->default(60); // 休憩時間:60分(default)
             $table->text('notes')->nullable();
             $table->timestamps();
             $table->softDeletes();

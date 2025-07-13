@@ -18,6 +18,11 @@
         </div>
 
         <div class="mb-3">
+            <label>休憩時間(分)</label>
+            <input type="Int" name="break_duration" value="{{ $attendance->break_duration ? $attendance->break_duration : '' }}" class="form-control">
+        </div>
+
+        <div class="mb-3">
             <label>備考</label>
             <textarea name="notes" class="form-control">{{ $attendance->notes }}</textarea>
         </div>
